@@ -1,3 +1,3 @@
-module PBL1_Redes_Chat_de_texto
+module PBL1_Redes
 
 go 1.21.6
