@@ -1,117 +1,172 @@
 package server
 
-import(
-	"net"
+import (
+	"bufio"
 	"encoding/json"
 	"fmt"
+	"net"
+	"strings"
 	"sync"
-	"PBL1_Redes/game"
 	"time"
 )
 
-
-type Client struct {
-    Name        string
-    Connection  net.Conn
-    IP          string
-    Stock     map[game.Carta]int
-    PlayedCard game.Carta
-}
-
+// Message representa uma mensagem entre clientes
 type Message struct {
 	Sender   string `json:"user"`
 	Receiver string `json:"to"`
 	Content  string `json:"content"`
 }
 
-type WaitingQueueManager struct{
-	locker            sync.RWMutex 
-	WaitingQueue []*Client
+// Client representa um usuário conectado
+type Client struct {
+	Name       string
+	Connection net.Conn
+	IP         string
+	MsgQueue   chan Message
+	Closed     chan struct{}
 }
 
-type PairedClientsManager struct {
-	locker            sync.RWMutex 
+// MatchManager gerencia clientes ativos, fila de espera e pareamentos
+type MatchManager struct {
+	ActiveClients map[string]*Client
+	WaitingQueue  []*Client
 	PairedClients map[string]string
+
+	ActiveMutex  sync.RWMutex
+	QueueMutex   sync.Mutex
+	PairedMutex  sync.RWMutex
+
+	NewClientCh chan struct{}
 }
 
-// Implementações da interface game.Jogador para Client
-
-func (c *Client) GetNome() string {
-	return c.Name
-}
-
-func (c *Client) GetEstoque() map[game.Carta]int {
-	return c.Stock
-}
-
-func (c *Client) GetCartaJogada() game.Carta {
-	return c.PlayedCard
-}
-
-func (c *Client) SetCartaJogada(card game.Carta) {
-	c.PlayedCard = card
-}
-
-func (c *Client) RemoverCarta(card game.Carta) {
-	if c.Stock[card] > 0 {
-		c.Stock[card]--
-		if c.Stock[card] == 0 {
-			delete(c.Stock, card)
-		}
+func NewMatchManager() *MatchManager {
+	return &MatchManager{
+		ActiveClients: make(map[string]*Client),
+		WaitingQueue:  []*Client{},
+		PairedClients: make(map[string]string),
+		NewClientCh:   make(chan struct{}, 1),
 	}
 }
 
-func (c *Client) AdicionarCarta(card game.Carta) {
-	c.Stock[card]++
-}
+// Adiciona cliente
+func (m *MatchManager) AddClient(client *Client) {
+	client.MsgQueue = make(chan Message, 50)
+	client.Closed = make(chan struct{})
 
-func (m *PairedClientsManager) MatchAdder(first_client *Client, second_client *Client) {
-	
-	m.locker.Lock()
-	defer m.locker.Unlock() 
+	m.ActiveMutex.Lock()
+	m.ActiveClients[strings.ToLower(client.Name)] = client
+	m.ActiveMutex.Unlock()
 
-	m.PairedClients[first_client.IP] = second_client.IP
-	m.PairedClients[second_client.IP] = first_client.IP
-
-	fmt.Println("Pares criados com sucesso.")
-}
-
-func (m *PairedClientsManager) MatchRemover(client *Client) {
-	// Bloqueia o mutex de escrita para garantir acesso exclusivo
-	m.locker.Lock()
-	defer m.locker.Unlock()
-
-	// Verifica se o cliente existe no mapa de pares
-	if pairID, ok := m.PairedClients[client.IP]; ok {
-		// Remove ambos os clientes do mapa de pares
-		delete(m.PairedClients, client.IP)
-		delete(m.PairedClients, pairID)
-
-		fmt.Printf("Pares de clientes removidos com sucesso: %s e %s.\n", client.IP, pairID)
-
-	} else {
-		// Se o cliente não estiver no mapa, nada a fazer
-		fmt.Printf("Cliente %s não encontrado no mapa de pares.\n", client.IP)
-	}
-}
-
-func (m *WaitingQueueManager) WQueueAdder(client *Client) {
-	m.locker.Lock()
-	defer m.locker.Unlock()
+	m.QueueMutex.Lock()
 	m.WaitingQueue = append(m.WaitingQueue, client)
+	m.QueueMutex.Unlock()
+
+	select {
+	case m.NewClientCh <- struct{}{}:
+	default:
+	}
+
+	go client.startWriter()
 }
 
-func (m *WaitingQueueManager) WQueueRemover(client *Client) {
-	m.locker.Lock()
-	defer m.locker.Unlock()
+// Remove cliente
+func (m *MatchManager) RemoveClient(clientName string) {
+	n := strings.ToLower(clientName)
 
+	m.ActiveMutex.Lock()
+	client, exists := m.ActiveClients[n]
+	if exists {
+		delete(m.ActiveClients, n)
+		close(client.Closed)
+	}
+	m.ActiveMutex.Unlock()
+
+	if !exists {
+		return
+	}
+
+	// Remove da fila de espera
+	m.QueueMutex.Lock()
 	for i, c := range m.WaitingQueue {
-		if c.IP == client.IP {
+		if strings.ToLower(c.Name) == n {
 			m.WaitingQueue = append(m.WaitingQueue[:i], m.WaitingQueue[i+1:]...)
-			return
+			break
+		}
+	}
+	m.QueueMutex.Unlock()
+
+	// Remove pareamento
+	m.PairedMutex.Lock()
+	if partnerName, ok := m.PairedClients[n]; ok {
+		delete(m.PairedClients, n)
+		delete(m.PairedClients, partnerName)
+
+		m.ActiveMutex.RLock()
+		if partner, exists := m.ActiveClients[partnerName]; exists {
+			notifyClient(partner, fmt.Sprintf("Seu parceiro %s desconectou e você voltou à fila de espera.", client.Name))
+			m.QueueMutex.Lock()
+			m.WaitingQueue = append(m.WaitingQueue, partner)
+			m.QueueMutex.Unlock()
+			select {
+			case m.NewClientCh <- struct{}{}:
+			default:
+			}
+		}
+		m.ActiveMutex.RUnlock()
+	}
+	m.PairedMutex.Unlock()
+
+	client.Connection.Close()
+}
+
+// Loop de pareamento
+func (m *MatchManager) RunPairing() {
+	for range m.NewClientCh {
+		for {
+			m.QueueMutex.Lock()
+			if len(m.WaitingQueue) < 2 {
+				m.QueueMutex.Unlock()
+				break
+			}
+			first := m.WaitingQueue[0]
+			second := m.WaitingQueue[1]
+			m.WaitingQueue = m.WaitingQueue[2:]
+			m.QueueMutex.Unlock()
+
+			fName := strings.ToLower(first.Name)
+			sName := strings.ToLower(second.Name)
+
+			m.PairedMutex.Lock()
+			m.PairedClients[fName] = sName
+			m.PairedClients[sName] = fName
+			m.PairedMutex.Unlock()
+
+			notifyClient(first, "Você foi conectado com "+second.Name)
+			notifyClient(second, "Você foi conectado com "+first.Name)
+
+			fmt.Printf("Par formado: %s <-> %s\n", first.Name, second.Name)
 		}
 	}
 }
+
+// Retorna parceiro
+func (m *MatchManager) GetPartner(clientName string) (*Client, bool) {
+	n := strings.ToLower(clientName)
+	m.PairedMutex.RLock()
+	partnerName, paired := m.PairedClients[n]
+	m.PairedMutex.RUnlock()
+	if !paired {
+		return nil, false
+	}
+
+	m.ActiveMutex.RLock()
+	partner, exists := m.ActiveClients[partnerName]
+	m.ActiveMutex.RUnlock()
+	return partner, exists
+}
+
+// -------------------------------------------------------------------
+var GlobalMatchManager = NewMatchManager()
 
 func Start() {
 	fmt.Println("Servidor de chat iniciado na porta 8080")
@@ -121,6 +176,8 @@ func Start() {
 		return
 	}
 	defer listener.Close()
+
+	go GlobalMatchManager.RunPairing()
 
 	for {
 		conn, err := listener.Accept()
@@ -132,111 +189,91 @@ func Start() {
 	}
 }
 
-var (
-	waitingQueueManager  = &WaitingQueueManager{WaitingQueue: []*Client{}}
-	pairedClientsManager = &PairedClientsManager{PairedClients: make(map[string]string)}
-)
-
+// -------------------------------------------------------------------
 func handleClientConnection(conn net.Conn) {
-	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	// Timeout para receber nome
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	data, err := reader.ReadString('\n')
+	if err != nil {
+		conn.Close()
+		return
+	}
+
+	var initialMsg Message
+	if err := json.Unmarshal([]byte(strings.TrimSpace(data)), &initialMsg); err != nil || initialMsg.Sender == "" {
+		conn.Write([]byte(`{"user":"Servidor","content":"Conexão inválida"}\n`))
+		conn.Close()
+		return
+	}
 
 	client := &Client{
-		Name:       conn.RemoteAddr().String(),
+		Name:       initialMsg.Sender,
 		Connection: conn,
 		IP:         conn.RemoteAddr().String(),
-		Stock: map[game.Carta]int{
-			game.Pedra:   3,
-			game.Papel:   3,
-			game.Tesoura: 3,
-		},
 	}
+	GlobalMatchManager.AddClient(client)
+	notifyClient(client, "Aguardando outro usuário se conectar...")
+	fmt.Printf("🔹 Usuário conectado: %s | IP: %s\n", client.Name, client.IP)
 
-	fmt.Printf("Novo cliente conectado: %s\n", client.IP)
-
-	decoder := json.NewDecoder(conn)
-	encoder := json.NewEncoder(conn)
-
-	// adiciona cliente na fila de espera
-	waitingQueueManager.WQueueAdder(client)
-	fmt.Printf("Cliente %s adicionado à fila de espera\n", client.IP)
-
-	// tenta emparelhar com outro cliente
-	var opponent *Client
-	waitingQueueManager.locker.Lock()
-	if len(waitingQueueManager.WaitingQueue) >= 2 {
-		if waitingQueueManager.WaitingQueue[0].IP == client.IP {
-			opponent = waitingQueueManager.WaitingQueue[1]
-		} else {
-			opponent = waitingQueueManager.WaitingQueue[0]
-		}
-		// remove ambos da fila
-		waitingQueueManager.WQueueRemover(client)
-		waitingQueueManager.WQueueRemover(opponent)
-		pairedClientsManager.MatchAdder(client, opponent)
-
-		fmt.Printf("Clientes emparelhados: %s vs %s\n", client.IP, opponent.IP)
-
-		// notifica ambos
-		json.NewEncoder(client.Connection).Encode(Message{
-			Sender:   "Servidor",
-			Receiver: client.Name,
-			Content:  "Você foi pareado! Jogo começando...",
-		})
-		json.NewEncoder(opponent.Connection).Encode(Message{
-			Sender:   "Servidor",
-			Receiver: opponent.Name,
-			Content:  "Você foi pareado! Jogo começando...",
-		})
-
-		go startGame(client, opponent)
-	}
-	waitingQueueManager.locker.Unlock()
-
-	// loop para manter conexão e ouvir mensagens (ex: sair do jogo)
 	for {
-		var msg Message
-		err := decoder.Decode(&msg)
+		// Timeout para leitura de cada mensagem
+		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		data, err := reader.ReadString('\n')
 		if err != nil {
-			fmt.Printf("Cliente %s desconectado: %v\n", client.IP, err)
-			waitingQueueManager.WQueueRemover(client)
-			pairedClientsManager.MatchRemover(client)
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				continue
+			}
+			fmt.Printf("❌ Usuário desconectado: %s | IP: %s\n", client.Name, client.IP)
+			GlobalMatchManager.RemoveClient(client.Name)
 			return
 		}
-		fmt.Printf("Mensagem de %s: %s\n", msg.Sender, msg.Content)
-		// apenas ecoa por enquanto
-		encoder.Encode(Message{
-			Sender:   "Servidor",
-			Receiver: msg.Sender,
-			Content:  "Mensagem recebida!",
-		})
-	}
-}
 
-// Função que executa rodadas entre dois clientes pareados
-func startGame(c1, c2 *Client) {
-	for {
-		vencedor, perdedor := game.JogaRodada(c1, c2)
-
-		var resultado string
-		if vencedor == nil {
-			resultado = fmt.Sprintf("Empate! Ambos jogaram %s", c1.PlayedCard)
-		} else {
-			resultado = fmt.Sprintf("Vencedor: %s com %s", vencedor.GetNome(), vencedor.GetCartaJogada())
-			game.TrocarCartas(vencedor, perdedor)
+		var msg Message
+		if err := json.Unmarshal([]byte(strings.TrimSpace(data)), &msg); err != nil {
+			continue
 		}
 
-		json.NewEncoder(c1.Connection).Encode(Message{
-			Sender:   "Servidor",
-			Receiver: c1.Name,
-			Content:  resultado,
-		})
-		json.NewEncoder(c2.Connection).Encode(Message{
-			Sender:   "Servidor",
-			Receiver: c2.Name,
-			Content:  resultado,
-		})
-
-		time.Sleep(3 * time.Second) // pausa entre rodadas
+		partner, ok := GlobalMatchManager.GetPartner(msg.Sender)
+		if ok && partner != nil {
+			outMsg := Message{
+				Sender:   msg.Sender,
+				Receiver: partner.Name,
+				Content:  msg.Content,
+			}
+			partner.MsgQueue <- outMsg
+			fmt.Printf("📩 %s -> %s | Mensagem: %s\n", msg.Sender, partner.Name, msg.Content)
+		} else {
+			notifyClient(client, "Ainda não há parceiro conectado.")
+		}
 	}
 }
 
+// -------------------------------------------------------------------
+func notifyClient(client *Client, content string) {
+	msg := Message{
+		Sender:   "Servidor",
+		Receiver: client.Name,
+		Content:  content,
+	}
+	client.MsgQueue <- msg
+}
+
+// Cada cliente tem uma goroutine para enviar mensagens de forma assíncrona
+func (c *Client) startWriter() {
+	go func() {
+		for {
+			select {
+			case msg := <-c.MsgQueue:
+				data, err := json.Marshal(msg)
+				if err == nil {
+					c.Connection.SetWriteDeadline(time.Now().Add(5 * time.Second))
+					c.Connection.Write(append(data, '\n'))
+				}
+			case <-c.Closed:
+				return
+			}
+		}
+	}()
+}
