@@ -1,41 +1,52 @@
 package server
 
-import(
-	"net"
+import (
+	"bufio"
 	"encoding/json"
 	"fmt"
+	"net"
 	"sync"
-	"PBL1_Redes/game"
 	"time"
+
+	"PBL1_Redes/game"
 )
 
-
+// Client representa um cliente conectado, com todas as ferramentas de comunicação e dados de jogo.
 type Client struct {
-    Name        string
-    Connection  net.Conn
-    IP          string
-    Stock     map[game.Carta]int
-    PlayedCard game.Carta
+	Name        string
+	Connection  net.Conn
+	IP          string
+	Stock       map[game.Carta]int
+	PlayedCard  game.Carta
+	Reader      *bufio.Reader
+	Writer      *bufio.Writer
+	Encoder     *json.Encoder
+	Decoder     *json.Decoder
 }
 
+// Message representa a estrutura de uma mensagem, agora com um campo "Action"
+// para roteamento.
 type Message struct {
-	Sender   string `json:"user"`
-	Receiver string `json:"to"`
-	Content  string `json:"content"`
+	Action string          `json:"action"`
+	Data   json.RawMessage `json:"data"`
 }
 
-type WaitingQueueManager struct{
-	locker            sync.RWMutex 
+// PairedMessage é um tipo de mensagem para notificar o cliente sobre o pareamento.
+type PairedMessage struct {
+	Content string `json:"content"`
+}
+
+type WaitingQueueManager struct {
+	locker       sync.RWMutex
 	WaitingQueue []*Client
 }
 
 type PairedClientsManager struct {
-	locker            sync.RWMutex 
+	locker        sync.RWMutex
 	PairedClients map[string]string
 }
 
 // Implementações da interface game.Jogador para Client
-
 func (c *Client) GetNome() string {
 	return c.Name
 }
@@ -66,9 +77,8 @@ func (c *Client) AdicionarCarta(card game.Carta) {
 }
 
 func (m *PairedClientsManager) MatchAdder(first_client *Client, second_client *Client) {
-	
 	m.locker.Lock()
-	defer m.locker.Unlock() 
+	defer m.locker.Unlock()
 
 	m.PairedClients[first_client.IP] = second_client.IP
 	m.PairedClients[second_client.IP] = first_client.IP
@@ -77,20 +87,14 @@ func (m *PairedClientsManager) MatchAdder(first_client *Client, second_client *C
 }
 
 func (m *PairedClientsManager) MatchRemover(client *Client) {
-	// Bloqueia o mutex de escrita para garantir acesso exclusivo
 	m.locker.Lock()
 	defer m.locker.Unlock()
 
-	// Verifica se o cliente existe no mapa de pares
 	if pairID, ok := m.PairedClients[client.IP]; ok {
-		// Remove ambos os clientes do mapa de pares
 		delete(m.PairedClients, client.IP)
 		delete(m.PairedClients, pairID)
-
 		fmt.Printf("Pares de clientes removidos com sucesso: %s e %s.\n", client.IP, pairID)
-
 	} else {
-		// Se o cliente não estiver no mapa, nada a fazer
 		fmt.Printf("Cliente %s não encontrado no mapa de pares.\n", client.IP)
 	}
 }
@@ -114,7 +118,7 @@ func (m *WaitingQueueManager) WQueueRemover(client *Client) {
 }
 
 func Start() {
-	fmt.Println("Servidor de chat iniciado na porta 8080")
+	fmt.Println("Servidor de jogo iniciado na porta 8080")
 	listener, err := net.Listen("tcp", ":8080")
 	if err != nil {
 		fmt.Println("Erro ao iniciar servidor:", err)
@@ -137,6 +141,7 @@ var (
 	pairedClientsManager = &PairedClientsManager{PairedClients: make(map[string]string)}
 )
 
+// handleClientConnection agora usa um loop de decodificação e um switch para rotear as ações.
 func handleClientConnection(conn net.Conn) {
 	defer conn.Close()
 
@@ -149,70 +154,104 @@ func handleClientConnection(conn net.Conn) {
 			game.Papel:   3,
 			game.Tesoura: 3,
 		},
+		Encoder: json.NewEncoder(conn),
+		Decoder: json.NewDecoder(conn),
 	}
 
 	fmt.Printf("Novo cliente conectado: %s\n", client.IP)
 
-	decoder := json.NewDecoder(conn)
-	encoder := json.NewEncoder(conn)
+	// Ações iniciais ao conectar
 
-	// adiciona cliente na fila de espera
-	waitingQueueManager.WQueueAdder(client)
 	fmt.Printf("Cliente %s adicionado à fila de espera\n", client.IP)
+	tryMatch(client)
 
-	// tenta emparelhar com outro cliente
-	var opponent *Client
-	waitingQueueManager.locker.Lock()
-	if len(waitingQueueManager.WaitingQueue) >= 2 {
-		if waitingQueueManager.WaitingQueue[0].IP == client.IP {
-			opponent = waitingQueueManager.WaitingQueue[1]
-		} else {
-			opponent = waitingQueueManager.WaitingQueue[0]
-		}
-		// remove ambos da fila
-		waitingQueueManager.WQueueRemover(client)
-		waitingQueueManager.WQueueRemover(opponent)
-		pairedClientsManager.MatchAdder(client, opponent)
-
-		fmt.Printf("Clientes emparelhados: %s vs %s\n", client.IP, opponent.IP)
-
-		// notifica ambos
-		json.NewEncoder(client.Connection).Encode(Message{
-			Sender:   "Servidor",
-			Receiver: client.Name,
-			Content:  "Você foi pareado! Jogo começando...",
-		})
-		json.NewEncoder(opponent.Connection).Encode(Message{
-			Sender:   "Servidor",
-			Receiver: opponent.Name,
-			Content:  "Você foi pareado! Jogo começando...",
-		})
-
-		go startGame(client, opponent)
-	}
-	waitingQueueManager.locker.Unlock()
-
-	// loop para manter conexão e ouvir mensagens (ex: sair do jogo)
 	for {
 		var msg Message
-		err := decoder.Decode(&msg)
+		err := client.Decoder.Decode(&msg)
 		if err != nil {
 			fmt.Printf("Cliente %s desconectado: %v\n", client.IP, err)
 			waitingQueueManager.WQueueRemover(client)
 			pairedClientsManager.MatchRemover(client)
 			return
 		}
-		fmt.Printf("Mensagem de %s: %s\n", msg.Sender, msg.Content)
-		// apenas ecoa por enquanto
-		encoder.Encode(Message{
-			Sender:   "Servidor",
-			Receiver: msg.Sender,
-			Content:  "Mensagem recebida!",
-		})
+
+		// Roteamento de ações
+		switch msg.Action {
+		case "ping":
+			handlePing(client, msg)
+		case "jogar":
+			handlePlay(client, msg)
+		default:
+			sendErrorMessage(client.Encoder, "Ação desconhecida.")
+		}
 	}
 }
 
-// Função que executa rodadas entre dois clientes pareados
+// tryMatch tenta emparelhar um cliente assim que ele entra na fila de espera.
+func tryMatch(client *Client) {
+	waitingQueueManager.locker.Lock()
+	defer waitingQueueManager.locker.Unlock()
+
+	if len(waitingQueueManager.WaitingQueue) >= 2 {
+		var opponent *Client
+		if waitingQueueManager.WaitingQueue[0].IP == client.IP {
+			opponent = waitingQueueManager.WaitingQueue[1]
+		} else {
+			opponent = waitingQueueManager.WaitingQueue[0]
+		}
+
+		waitingQueueManager.WQueueRemover(client)
+		waitingQueueManager.WQueueRemover(opponent)
+		pairedClientsManager.MatchAdder(client, opponent)
+
+		fmt.Printf("Clientes emparelhados: %s vs %s\n", client.IP, opponent.IP)
+
+		// Envia mensagens de pareamento para ambos os clientes
+		pairedMsg, _ := json.Marshal(PairedMessage{Content: "Você foi pareado! Jogo começando..."})
+		sendActionMessage(client.Encoder, "matched", pairedMsg)
+		sendActionMessage(opponent.Encoder, "matched", pairedMsg)
+
+		go startGame(client, opponent)
+	}
+}
+
+// handlePing responde a uma ação de ping.
+func handlePing(client *Client, msg Message) {
+	start := time.Now()
+	// Envia a mensagem de resposta "PONG" para o cliente
+	pongMsg, _ := json.Marshal(PairedMessage{Content: "PONG"})
+	sendActionMessage(client.Encoder, "pong", pongMsg)
+
+	// Calcula a latência e a converte para milissegundos
+	latency := time.Since(start).Milliseconds()
+
+	fmt.Printf("Ping de %s: %dms\n", client.IP, latency)
+
+	// Envia a latência de volta para o cliente
+	latencyMsg, _ := json.Marshal(PairedMessage{Content: fmt.Sprintf("Ping: %dms", latency)})
+	sendActionMessage(client.Encoder, "pong_response", latencyMsg)
+}
+
+// handlePlay lida com a ação de um jogador jogar uma carta.
+func handlePlay(client *Client, msg Message) {
+	// Lógica para lidar com a carta jogada pelo cliente.
+	// Por exemplo, decodificar o payload da carta.
+	// Nota: A lógica do jogo em si (startGame) é independente deste handler,
+	// mas este é o ponto de entrada para o cliente enviar a jogada.
+	//
+	// Exemplo de payload: {"carta_escolhida": "Pedra"}
+	// var payload struct {
+	//    CartaEscolhida game.Carta `json:"carta_escolhida"`
+	// }
+	//
+	// json.Unmarshal(msg.Data, &payload)
+	// client.SetCartaJogada(payload.CartaEscolhida)
+	//
+	fmt.Printf("Recebi ação 'jogar' do cliente %s\n", client.IP)
+	sendActionMessage(client.Encoder, "game_status", json.RawMessage(`{"status": "Jogada recebida!"}`))
+}
+
+// startGame é uma goroutine que gerencia o fluxo de uma partida.
 func startGame(c1, c2 *Client) {
 	for {
 		vencedor, perdedor := game.JogaRodada(c1, c2)
@@ -225,18 +264,30 @@ func startGame(c1, c2 *Client) {
 			game.TrocarCartas(vencedor, perdedor)
 		}
 
-		json.NewEncoder(c1.Connection).Encode(Message{
-			Sender:   "Servidor",
-			Receiver: c1.Name,
-			Content:  resultado,
-		})
-		json.NewEncoder(c2.Connection).Encode(Message{
-			Sender:   "Servidor",
-			Receiver: c2.Name,
-			Content:  resultado,
-		})
+		resultMsg, _ := json.Marshal(PairedMessage{Content: resultado})
+		sendActionMessage(c1.Encoder, "game_round_result", resultMsg)
+		sendActionMessage(c2.Encoder, "game_round_result", resultMsg)
 
-		time.Sleep(3 * time.Second) // pausa entre rodadas
+		time.Sleep(3 * time.Second)
 	}
 }
 
+// sendActionMessage é uma função auxiliar para enviar mensagens no formato de Ação.
+func sendActionMessage(encoder *json.Encoder, action string, data json.RawMessage) {
+	finalMsg := Message{
+		Action: action,
+		Data:   data,
+	}
+	_ = encoder.Encode(finalMsg)
+}
+
+// sendErrorMessage é uma função auxiliar para enviar mensagens de erro.
+func sendErrorMessage(encoder *json.Encoder, errorMsg string) {
+	payload := map[string]string{"error": errorMsg}
+	data, _ := json.Marshal(payload)
+	finalMsg := Message{
+		Action: "error",
+		Data:   data,
+	}
+	_ = encoder.Encode(finalMsg)
+}
