@@ -1,88 +1,101 @@
-# PBL1_Redes
-Primeiro problema da disciplina TEC 502 concorrência e conectividade "Jogo de Cartas Multiplayer" desenvolvido em Go
-Guia de Execução do Jogo com Docker
+Com certeza. Transformei o guia de execução em um formato estruturado e claro, ideal para ser inserido diretamente em um arquivo README.md no seu projeto.
 
-1. Iniciar o Ambiente com Docker
+Este guia explica de forma objetiva como qualquer pessoa com os arquivos e o Docker instalados pode compilar, executar, testar e encerrar o ambiente do jogo.
 
-O processo de inicialização é dividido em duas etapas: construir as imagens (só precisa ser feito na primeira vez ou após alterações no código) e iniciar os containers.
+Jogo de Cartas Multiplayer - Guia de Execução com Docker
 
-Passo 1: Construir as Imagens (Build)
+Este guia fornece as instruções passo a passo para configurar e executar o ambiente completo do jogo, utilizando a estrutura de Docker e Docker Compose já presente no projeto.
 
-Primeiro, navegue até a pasta raiz do seu projeto (PBL1_Redes-card_game/) no terminal. Em seguida, execute o comando build. Ele lerá seu arquivo docker-compose.yml, encontrará as instruções de build para os serviços server, client e tests, e criará as respectivas imagens Docker.
+Pré-requisitos
+
+Antes de começar, certifique-se de que você tem os seguintes softwares instalados e em execução na sua máquina:
+
+    Docker
+
+    Docker Compose (geralmente incluído com a instalação do Docker Desktop)
+
+Execução Passo a Passo
+
+Todos os comandos devem ser executados a partir do diretório raiz do projeto (a pasta que contém o arquivo docker-compose.yml).
+
+1. Construir as Imagens Docker (build)
+
+O primeiro passo é construir as imagens para cada um dos serviços (servidor, cliente e testes) a partir de seus respectivos Dockerfiles.
 Bash
 
 docker-compose build
 
-Passo 2: Iniciar o Servidor
+Este comando irá ler o 
 
-Para iniciar o servidor, usamos o comando up. A flag -d (detached) faz com que o container do servidor rode em segundo plano, liberando seu terminal.
+docker-compose.yml, encontrar as instruções de build para cada serviço e criar as imagens Docker locais.
+
+2. Iniciar o Servidor (up)
+
+Com as imagens prontas, você pode iniciar o container do servidor. Usamos a flag -d para que ele rode em segundo plano (detached mode).
 Bash
 
 docker-compose up -d server
 
-Neste momento, seu servidor de jogo está no ar e escutando na porta 8080, pronto para receber conexões.
+Neste ponto, o servidor do jogo estará no ar e pronto para aceitar conexões na porta 
 
-2. Conectar os Containers e Serviços (Como Funciona)
-
-A orquestração da comunicação é gerenciada inteiramente pelo Docker Compose, baseado no que foi definido no arquivo docker-compose.yml:
-
-    Rede Virtual: Foi criada uma rede privada chamada cardgame-net. Todos os serviços (
-
-server, client, tests) são conectados a esta rede, permitindo que eles se comuniquem uns com os outros usando seus nomes de serviço como se fossem nomes de domínio.
-
-Resolução de Nomes: Dentro desta rede, o container do client pode encontrar o container do server simplesmente se conectando ao endereço server:8080. O Docker se encarrega de direcionar o tráfego para o IP interno correto do container do servidor.
-
-Ordem de Inicialização: A diretiva depends_on: - server no serviço do client e tests garante que o Docker Compose sempre iniciará o container do server antes de iniciar qualquer um dos outros containers que precisam se conectar a ele.
+8080.
 
 3. Acessar o Jogo (Executar o Cliente)
 
-Com o servidor rodando em segundo plano, você pode iniciar o cliente para começar a jogar. O cliente é um aplicativo de console interativo.
-
-Execute o seguinte comando no seu terminal:
+Para jogar, inicie o container do cliente de forma interativa. Ele se conectará automaticamente ao container do servidor.
 Bash
 
 docker-compose run --rm client server
 
 Análise do Comando:
 
-    docker-compose run: Inicia uma nova instância do serviço especificado. É ideal para tarefas que você executa e que depois terminam, como o cliente ou os testes.
+    docker-compose run: Inicia uma instância única do serviço client.
 
-    --rm: Uma flag muito útil que remove automaticamente o container do cliente assim que você encerrar a sessão (digitando exit), mantendo seu sistema limpo.
+--rm: Flag que remove o container automaticamente assim que a sessão do jogo terminar, mantendo o sistema limpo.
 
-    client: O nome do serviço que queremos executar, conforme definido no docker-compose.yml.
+client: O nome do serviço que queremos executar.
 
-    server: Este é um argumento passado para o comando de inicialização do cliente. O seu userStart.go foi programado para usar este argumento como o endereço IP do servidor. Dentro da rede Docker, server é o nome de host do container do servidor.
+server: Este argumento é passado para o programa cliente, informando que o endereço do servidor é server dentro da rede Docker.
 
-Após executar este comando, você estará conectado ao terminal interativo do cliente e poderá usar os comandos do jogo (stock, pack, play, ping, etc.).
+Após executar este comando, seu terminal estará conectado ao cliente do jogo, e você poderá usar os comandos como stock, pack, play, etc.
 
-4. Monitoramento e Logs
+Comandos Adicionais de Gerenciamento
 
-Para verificar o que está acontecendo no servidor (conexões de jogadores, pareamentos, erros, etc.), você pode visualizar os logs do container do servidor em tempo real.
+Monitoramento e Logs
 
-Abra um novo terminal (ou use o que você usou para iniciar o servidor, se não usou a flag -d) e execute:
+Para visualizar os logs do servidor em tempo real (ver conexões, pareamentos, erros, etc.), utilize o seguinte comando em um novo terminal:
 Bash
 
 docker-compose logs -f server
 
-    logs: O comando para visualizar os logs.
+    A flag -f (follow) mantém o terminal exibindo novas mensagens de log assim que são geradas.
 
-    -f (follow): Mantém o terminal aberto, exibindo novas mensagens de log assim que elas são geradas pelo servidor.
+Executar os Testes Automatizados
 
-Pressione Ctrl+C para parar de visualizar os logs.
+O ambiente Docker também está configurado para rodar a suíte de testes contra o servidor. Com o servidor em execução (após o docker-compose up -d server), execute:
+Bash
 
-5. Encerramento do Jogo
+docker-compose run --rm tests
 
-Quando você terminar de jogar e quiser desligar todo o ambiente, use o comando down.
+Este comando iniciará o container de testes, que executará o 
+
+go test -v ./... contra o container do servidor e exibirá os resultados.
+
+Encerramento do Jogo
+
+Quando terminar, você pode parar e remover todos os containers, redes e outros recursos criados pelo Docker Compose com um único comando:
 Bash
 
 docker-compose down
 
-Este comando irá:
+Como a Comunicação Funciona
 
-    Parar os containers que estiverem em execução (como o server).
+O 
 
-    Remover os containers criados.
+docker-compose.yml define uma rede virtual privada chamada cardgame-net. Todos os serviços (
 
-    Remover a rede virtual (cardgame-net) que foi criada.
+server, client, tests) são conectados a esta rede. Isso permite que eles se comuniquem usando seus nomes de serviço como se fossem nomes de domínio. É por isso que o cliente consegue se conectar ao servidor usando o endereço 
 
-Isso garante que todos os recursos utilizados pelo Docker para o seu jogo sejam completamente liberados da sua máquina.
+server em vez de um endereço IP. A diretiva 
+
+depends_on garante que o servidor sempre inicie antes dos componentes que precisam dele.
