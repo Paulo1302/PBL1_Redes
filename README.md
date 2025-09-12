@@ -1,7 +1,3 @@
-Com certeza. Transformei o guia de execução em um formato estruturado e claro, ideal para ser inserido diretamente em um arquivo README.md no seu projeto.
-
-Este guia explica de forma objetiva como qualquer pessoa com os arquivos e o Docker instalados pode compilar, executar, testar e encerrar o ambiente do jogo.
-
 Jogo de Cartas Multiplayer - Guia de Execução com Docker
 
 Este guia fornece as instruções passo a passo para configurar e executar o ambiente completo do jogo, utilizando a estrutura de Docker e Docker Compose já presente no projeto.
