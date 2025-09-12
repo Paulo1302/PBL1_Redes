@@ -8,6 +8,8 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
+	"time"
 )
 
 // Message usa o mesmo formato do servidor para compatibilidade.
@@ -22,7 +24,7 @@ type UserData struct {
 	Stock map[string]int `json:"stock"`
 }
 
-// Payloads para diferentes ações
+// Payloads para diferentes ações de comunicação
 type ResponseData struct {
 	Content string `json:"content"`
 	Error   string `json:"error"`
@@ -34,16 +36,33 @@ type GameOverData struct {
 	Content    string         `json:"content"`
 	FinalStock map[string]int `json:"final_stock"`
 }
-// OpenPackData para decodificar a resposta de abrir pacote
 type OpenPackData struct {
 	Content  string         `json:"content"`
 	NewCards []string       `json:"new_cards"`
 	NewStock map[string]int `json:"new_stock"`
 }
+type RoundResultData struct {
+	Result     string `json:"result"`
+	Winner     string `json:"winner,omitempty"`
+	Loser      string `json:"loser,omitempty"`
+	WinnerCard string `json:"winner_card,omitempty"`
+	LoserCard  string `json:"loser_card,omitempty"`
+	DrawCard   string `json:"draw_card,omitempty"`
+}
 
-var currentUserData UserData
+// PingManager gerencia o estado do ping para evitar condições de corrida.
+type PingManager struct {
+	mu        sync.Mutex
+	startTime time.Time
+}
+
+var (
+	currentUserData UserData
+	pingManager     = &PingManager{}
+)
 const userDataFile = "user_data.json"
 
+// saveData salva o estado atual do usuário no arquivo JSON.
 func saveData() error {
 	file, err := os.Create(userDataFile)
 	if err != nil {
@@ -56,6 +75,7 @@ func saveData() error {
 	return encoder.Encode(currentUserData)
 }
 
+// loadData carrega o estado do usuário do arquivo JSON. Se não existir, cria um novo usuário.
 func loadData() {
 	file, err := os.Open(userDataFile)
 	if err != nil {
@@ -63,7 +83,7 @@ func loadData() {
 		fmt.Print("Digite seu nome: ")
 		reader := bufio.NewReader(os.Stdin)
 		name, _ := reader.ReadString('\n')
-		
+
 		currentUserData = UserData{
 			Name: strings.TrimSpace(name),
 			Stock: map[string]int{
@@ -86,11 +106,11 @@ func loadData() {
 	fmt.Printf("Bem-vindo de volta, %s!\n", currentUserData.Name)
 }
 
+// ServerConn estabelece e gerencia uma sessão interativa com o servidor.
 func ServerConn(serverIP string) error {
 	loadData()
 
-	// Usando o IP recebido como argumento para a conexão
-	conn, err := net.Dial("tcp", serverIP+":8080") // Porta permanece fixa em 8080
+	conn, err := net.Dial("tcp", serverIP+":8080")
 	if err != nil {
 		return fmt.Errorf("erro ao conectar no servidor: %w", err)
 	}
@@ -109,7 +129,6 @@ func ServerConn(serverIP string) error {
 
 	scanner := bufio.NewScanner(os.Stdin)
 	for scanner.Scan() {
-		// O código continua igual, sem mudanças aqui
 		input := strings.TrimSpace(scanner.Text())
 		parts := strings.Split(input, " ")
 		command := parts[0]
@@ -119,10 +138,13 @@ func ServerConn(serverIP string) error {
 
 		switch command {
 		case "ping":
+			pingManager.mu.Lock()
+			pingManager.startTime = time.Now()
+			pingManager.mu.Unlock()
 			msg.Action = "ping"
 		case "play":
 			msg.Action = "queue_for_match"
-		case "pack": // NOVO COMANDO
+		case "pack":
 			msg.Action = "open_pack"
 		case "move":
 			if len(parts) < 2 {
@@ -144,7 +166,7 @@ func ServerConn(serverIP string) error {
 		case "help":
 			fmt.Println("\nComandos disponíveis:")
 			fmt.Println("  stock         - Mostra as cartas que você possui.")
-			fmt.Println("  pack          - Abre um pacote de 3 cartas aleatórias.") // AJUDA ATUALIZADA
+			fmt.Println("  pack          - Abre um pacote de 3 cartas aleatórias.")
 			fmt.Println("  ping          - Verifica a latência com o servidor.")
 			fmt.Println("  play          - Entra na fila para encontrar uma partida.")
 			fmt.Println("  move <card>   - Joga uma carta (ex: move Rock).")
@@ -155,10 +177,12 @@ func ServerConn(serverIP string) error {
 			fmt.Println("Desconectando...")
 			return nil
 		default:
-			fmt.Printf("Comando desconhecido: '%s'. Digite 'help'.\n", command)
+			if command != "" {
+				fmt.Printf("Comando desconhecido: '%s'. Digite 'help'.\n", command)
+			}
 			continue
 		}
-		
+
 		if data != nil {
 			jsonData, err := json.Marshal(data)
 			if err != nil {
@@ -175,6 +199,8 @@ func ServerConn(serverIP string) error {
 	}
 	return scanner.Err()
 }
+
+// listenServer processa mensagens recebidas do servidor em uma goroutine separada.
 func listenServer(conn net.Conn) {
 	decoder := json.NewDecoder(conn)
 	for {
@@ -187,8 +213,15 @@ func listenServer(conn net.Conn) {
 
 		fmt.Printf("\n<-- [MENSAGEM DO SERVIDOR | Ação: %s]\n", msg.Action)
 
-		// O 'switch' ajuda a organizar o tratamento de diferentes ações
 		switch msg.Action {
+		case "pong":
+			pingManager.mu.Lock()
+			if !pingManager.startTime.IsZero() {
+				latency := time.Since(pingManager.startTime)
+				fmt.Printf("    Latência (RTT): %v\n", latency)
+				pingManager.startTime = time.Time{}
+			}
+			pingManager.mu.Unlock()
 		case "game_over":
 			var gameOverData GameOverData
 			if err := json.Unmarshal(msg.Data, &gameOverData); err == nil {
@@ -202,17 +235,25 @@ func listenServer(conn net.Conn) {
 					}
 				}
 			}
-		case "open_pack_success": // NOVO CASE
+		case "open_pack_success":
 			var packData OpenPackData
 			if err := json.Unmarshal(msg.Data, &packData); err == nil {
 				fmt.Printf("    %s\n", packData.Content)
 				fmt.Printf("    Você recebeu: %v\n", packData.NewCards)
-				
-				currentUserData.Stock = packData.NewStock // Atualiza o inventário com a versão do servidor
+				currentUserData.Stock = packData.NewStock
 				if err := saveData(); err != nil {
 					fmt.Printf("    ERRO: Falha ao salvar seu novo inventário: %v\n", err)
 				} else {
 					fmt.Printf("    Inventário salvo! %v\n", currentUserData.Stock)
+				}
+			}
+		case "game_round_result":
+			var roundData RoundResultData
+			if err := json.Unmarshal(msg.Data, &roundData); err == nil {
+				if roundData.Result == "Draw" {
+					fmt.Printf("    Resultado: Empate! Ambos jogaram %s.\n", roundData.DrawCard)
+				} else {
+					fmt.Printf("    Resultado: %s jogou %s e venceu %s, que jogou %s.\n", roundData.Winner, roundData.WinnerCard, roundData.Loser, roundData.LoserCard)
 				}
 			}
 		default: // Mensagens normais

@@ -5,25 +5,31 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
-	"PBL1_Redes/server"
-	"sort"
+	"os"
+	"PBL1_Redes-card_game/server"
 	"sync"
 	"testing"
 	"time"
 )
 
-// --- Test Harness (Estrutura de Suporte aos Testes) ---
+// --- Gerenciamento do Ciclo de Vida dos Testes ---
 
-// withTestServer inicia um servidor para um único teste e garante seu desligamento.
-func withTestServer(t *testing.T, testFunc func(t *testing.T)) {
-	t.Helper()
+// TestMain é executado uma vez para todo o pacote. Inicia o servidor antes
+// de todos os testes e o desliga no final, criando um ambiente estável.
+func TestMain(m *testing.M) {
+	fmt.Println("Setting up test suite, starting server...")
 	shutdown := server.Start()
-	defer shutdown()
-	time.Sleep(50 * time.Millisecond) // Garante que o servidor esteja pronto
-	testFunc(t)
+	time.Sleep(100 * time.Millisecond) // Dá tempo para o servidor iniciar
+
+	// Roda todos os testes
+	exitCode := m.Run()
+
+	fmt.Println("Tearing down test suite, shutting down server...")
+	shutdown()
+	os.Exit(exitCode)
 }
 
-// --- Helper Structs and Functions ---
+// --- Estruturas e Funções Auxiliares ---
 
 type Message struct {
 	Action string          `json:"action"`
@@ -34,6 +40,7 @@ type RegisterPayload struct {
 	Stock map[string]int `json:"stock"`
 }
 
+// connectAndRegister é uma função auxiliar para conectar e registrar um cliente de teste.
 func connectAndRegister(t *testing.T, name string) net.Conn {
 	t.Helper()
 	conn, err := net.Dial("tcp", "localhost:8080")
@@ -54,169 +61,139 @@ func connectAndRegister(t *testing.T, name string) net.Conn {
 	return conn
 }
 
-// --- Test Cases (Casos de Teste) ---
+// --- Casos de Teste ---
 
-// TestConnectionWithServerClosed valida que a conexão falha quando o servidor não está rodando.
-func TestConnectionWithServerClosed(t *testing.T) {
-	_, err := net.DialTimeout("tcp", "localhost:8080", 100*time.Millisecond)
-	if err == nil {
-		t.Fatal("Expected connection to fail, but it succeeded.")
+// TestFullGameFlow valida o fluxo de um jogo normal com dois jogadores.
+func TestFullGameFlow(t *testing.T) {
+	client1Conn := connectAndRegister(t, "Player1")
+	defer client1Conn.Close()
+	client2Conn := connectAndRegister(t, "Player2")
+	defer client2Conn.Close()
+
+	// Ambos os clientes entram na fila de pareamento
+	queueMsg := Message{Action: "queue_for_match"}
+	_ = json.NewEncoder(client1Conn).Encode(queueMsg)
+	_ = json.NewEncoder(client2Conn).Encode(queueMsg)
+
+	// Ambos devem receber a confirmação de entrada na fila e, em seguida, a de pareamento.
+	decoder1 := json.NewDecoder(client1Conn)
+	decoder2 := json.NewDecoder(client2Conn)
+	var msg1, msg2 Message
+
+	_ = decoder1.Decode(&msg1) // queue_success
+	_ = decoder2.Decode(&msg2) // queue_success
+	if msg1.Action != "queue_success" || msg2.Action != "queue_success" {
+		t.Fatal("Did not receive queue_success from both clients")
+	}
+
+	_ = decoder1.Decode(&msg1) // matched
+	_ = decoder2.Decode(&msg2) // matched
+	if msg1.Action != "matched" {
+		t.Errorf("Client 1 was not matched. Got: %s", msg1.Action)
+	}
+	if msg2.Action != "matched" {
+		t.Errorf("Client 2 was not matched. Got: %s", msg2.Action)
 	}
 }
 
-// TestRegistrationAndPing testa o fluxo básico de registro e ping.
-func TestRegistrationAndPing(t *testing.T) {
-	withTestServer(t, func(t *testing.T) {
-		conn := connectAndRegister(t, "PingTester")
-		defer conn.Close()
-		// ... (a lógica do teste permanece a mesma)
-	})
+// TestStressMatchmaking valida a sincronização do pareamento sob carga.
+func TestStressMatchmaking(t *testing.T) {
+	numClients := 100 // Deve ser um número par para que todos possam ser pareados
+	var wg sync.WaitGroup
+	wg.Add(numClients)
+
+	for i := 0; i < numClients; i++ {
+		go func(id int) {
+			defer wg.Done()
+			clientName := fmt.Sprintf("StressClient_%d", id)
+
+			// t.Run agrupa a lógica e o output para cada cliente
+			t.Run(clientName, func(t *testing.T) {
+				t.Parallel() // Permite que os sub-testes de cada cliente rodem em paralelo
+
+				conn := connectAndRegister(t, clientName)
+				defer conn.Close()
+
+				// Envia a requisição para entrar na fila
+				queueMsg := Message{Action: "queue_for_match"}
+				if err := json.NewEncoder(conn).Encode(queueMsg); err != nil {
+					t.Errorf("Failed to send queue message: %v", err)
+					return
+				}
+
+				decoder := json.NewDecoder(conn)
+				var response Message
+				
+				// Define um timeout para as respostas do servidor
+				conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+
+				// Lê a confirmação de entrada na fila
+				if err := decoder.Decode(&response); err != nil || response.Action != "queue_success" {
+					t.Errorf("Did not receive queue_success in time. Action: %s, err: %v", response.Action, err)
+					return
+				}
+				
+				// Espera pela mensagem de pareamento
+				if err := decoder.Decode(&response); err != nil || response.Action != "matched" {
+					t.Errorf("Failed to get matched in time. Action: %s, err: %v", response.Action, err)
+					return
+				}
+			})
+		}(i)
+	}
+	
+	// WaitGroup espera que todas as goroutines (e seus sub-testes) terminem.
+	wg.Wait()
 }
+// File: Test_files/game_server_test.go
 
-// (Outros testes como TestOpenPack, TestFullGameFlow, etc., seguiriam o mesmo padrão)
+// TestStressPing aplica uma carga de múltiplos clientes enviando pings repetidamente
+// para medir a capacidade de resposta do servidor a requisições de baixo custo.
+func TestStressPing(t *testing.T) {
+	concurrency := 100 // Número de clientes simultâneos
+	pingsPerClient := 10 // Quantidade de pings que cada cliente enviará
 
-// --- Teste de Estresse Integrado ---
+	var wg sync.WaitGroup
+	wg.Add(concurrency)
 
-// result armazena o resultado de uma única requisição.
-type stressResult struct {
-	latency time.Duration
-	err     error
-}
+	for i := 0; i < concurrency; i++ {
+		go func(id int) {
+			defer wg.Done()
+			clientName := fmt.Sprintf("PingClient_%d", id)
 
-// stressWorker simula a jornada de um usuário para o teste de estresse.
-func stressWorker(id int, addr string, requests int, timeout time.Duration, out chan<- stressResult) {
-	conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
-	if err != nil {
-		out <- stressResult{err: fmt.Errorf("worker %d dial: %w", id, err)}
-		return
-	}
-	defer conn.Close()
+			t.Run(clientName, func(t *testing.T) {
+				t.Parallel() // Permite que os clientes rodem em paralelo
 
-	enc := json.NewEncoder(conn)
-	dec := json.NewDecoder(conn)
+				conn := connectAndRegister(t, clientName)
+				defer conn.Close()
 
-	registerPayload := RegisterPayload{
-		Name:  fmt.Sprintf("stress_user_%d", id),
-		Stock: map[string]int{"Rock": 3, "Paper": 3, "Scissors": 3},
-	}
-	req := Message{Action: "register", Data: json.RawMessage(mustMarshal(registerPayload))}
-	if err := enc.Encode(&req); err != nil {
-		out <- stressResult{err: fmt.Errorf("worker %d encode register: %w", id, err)}
-		return
-	}
+				encoder := json.NewEncoder(conn)
+				decoder := json.NewDecoder(conn)
+				pingMsg := Message{Action: "ping"}
 
-	openPackReq := Message{Action: "open_pack"}
-	for i := 0; i < requests; i++ {
-		start := time.Now()
-		if err := enc.Encode(&openPackReq); err != nil {
-			out <- stressResult{err: fmt.Errorf("worker %d encode open_pack: %w", id, err)}
-			return
-		}
-		var resp Message
-		if err := dec.Decode(&resp); err != nil {
-			out <- stressResult{err: fmt.Errorf("worker %d decode open_pack resp: %w", id, err)}
-			return
-		}
-		out <- stressResult{latency: time.Since(start)}
-	}
-}
+				// Cada cliente envia múltiplos pings em sequência
+				for j := 0; j < pingsPerClient; j++ {
+					if err := encoder.Encode(pingMsg); err != nil {
+						t.Errorf("Request #%d: Failed to send ping: %v", j+1, err)
+						return // Interrompe o teste para este cliente em caso de erro
+					}
 
-// TestStressWithBenchmarkReport executa um teste de estresse rápido e integrado.
-func TestStressWithBenchmarkReport(t *testing.T) {
-	withTestServer(t, func(t *testing.T) {
-		// Configurações fixas para um teste rápido e automatizado
-		concurrency := 20
-		requestsPerConn := 5
-		timeout := 5 * time.Second
+					conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+					var response Message
+					if err := decoder.Decode(&response); err != nil {
+						t.Errorf("Request #%d: Failed to receive pong: %v", j+1, err)
+						return
+					}
 
-		totalExpected := concurrency * requestsPerConn
-		results := make(chan stressResult, totalExpected)
-
-		t.Logf("Running integrated stress test: %d clients, %d requests each...", concurrency, requestsPerConn)
-
-		startAll := time.Now()
-
-		var wg sync.WaitGroup
-		wg.Add(concurrency)
-		for i := 0; i < concurrency; i++ {
-			go func(id int) {
-				defer wg.Done()
-				stressWorker(id, "localhost:8080", requestsPerConn, timeout, results)
-			}(i)
-		}
-		wg.Wait()
-		close(results)
-
-		elapsed := time.Since(startAll)
-
-		// Coleta e processa os resultados
-		var latencies []time.Duration
-		errors := 0
-		for r := range results {
-			if r.err != nil {
-				errors++
-				t.Errorf("Stress worker error: %v", r.err)
-				continue
-			}
-			latencies = append(latencies, r.latency)
-		}
-
-		if errors > 0 {
-			t.Fatalf("%d errors occurred during stress test, failing.", errors)
-		}
-
-		// Imprime o relatório de benchmark
-		printBenchmarkReport(t, latencies, elapsed, totalExpected)
-	})
-}
-
-// --- Funções Auxiliares para o Benchmark ---
-
-func mustMarshal(v interface{}) []byte {
-	b, err := json.Marshal(v)
-	if err != nil {
-		panic(err)
-	}
-	return b
-}
-
-func percentile(sorted []time.Duration, p float64) time.Duration {
-	if len(sorted) == 0 {
-		return 0
-	}
-	rank := int(p*float64(len(sorted)) + 0.5)
-	if rank < 1 {
-		rank = 1
-	}
-	if rank > len(sorted) {
-		rank = len(sorted)
-	}
-	return sorted[rank-1]
-}
-
-func printBenchmarkReport(t *testing.T, latencies []time.Duration, elapsed time.Duration, totalReqs int) {
-	success := len(latencies)
-	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
-
-	var avg time.Duration
-	for _, d := range latencies {
-		avg += d
-	}
-	if success > 0 {
-		avg /= time.Duration(success)
+					if response.Action != "pong" {
+						t.Errorf("Request #%d: Expected action 'pong' but got '%s'", j+1, response.Action)
+						return
+					}
+				}
+			})
+		}(i)
 	}
 
-	p50 := percentile(latencies, 0.50)
-	p90 := percentile(latencies, 0.90)
-	p99 := percentile(latencies, 0.99)
-	qps := float64(success) / elapsed.Seconds()
-
-	t.Logf("\n--- Benchmark Report ---\n")
-	t.Logf("Total Requests: %d\n", totalReqs)
-	t.Logf("Total Duration: %v\n", elapsed)
-	if success > 0 {
-		t.Logf("Avg Latency: %v | p50: %v | p90: %v | p99: %v\n", avg, p50, p90, p99)
-		t.Logf("Throughput: %.2f req/s (QPS)\n", qps)
-	}
-	t.Logf("----------------------\n")
+	// Espera que todos os clientes terminem de enviar todos os seus pings
+	wg.Wait()
 }

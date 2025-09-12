@@ -2,7 +2,7 @@
 package server_test
 
 import (
-	"PBL1_Redes/game"
+	"PBL1_Redes-card_game/game"
 	"testing"
 )
 

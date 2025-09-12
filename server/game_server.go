@@ -1,4 +1,3 @@
-// File: server/game_server.go
 package server
 
 import (
@@ -10,10 +9,10 @@ import (
 	"sync"
 	"time"
 
-	"PBL1_Redes/game"
+	"PBL1_Redes-card_game/game"
 )
 
-// Client representa um cliente conectado. O Stock agora é preenchido pelo cliente.
+// Client representa um cliente conectado, com gerenciamento de estado.
 type Client struct {
 	Name       string
 	Connection net.Conn
@@ -23,6 +22,8 @@ type Client struct {
 	Encoder    *json.Encoder
 	Decoder    *json.Decoder
 	MoveChan   chan game.Card
+	stateMutex sync.RWMutex
+	State      string // Estado: "Idle", "InQueue", "InGame"
 }
 
 // Payloads para comunicação
@@ -41,11 +42,18 @@ type GameOverPayload struct {
 	Content    string            `json:"content"`
 	FinalStock map[game.Card]int `json:"final_stock"`
 }
-// OpenPackPayload é a resposta estruturada ao abrir um pacote
 type OpenPackPayload struct {
 	Content  string            `json:"content"`
 	NewCards []game.Card       `json:"new_cards"`
 	NewStock map[game.Card]int `json:"new_stock"`
+}
+type RoundResultPayload struct {
+	Result     string    `json:"result"`
+	Winner     string    `json:"winner,omitempty"`
+	Loser      string    `json:"loser,omitempty"`
+	WinnerCard game.Card `json:"winner_card,omitempty"`
+	LoserCard  game.Card `json:"loser_card,omitempty"`
+	DrawCard   game.Card `json:"draw_card,omitempty"`
 }
 
 type WaitingQueueManager struct {
@@ -56,14 +64,12 @@ type PairedClientsManager struct {
 	locker        sync.RWMutex
 	PairedClients map[string]string
 }
-
-// GlobalCardStock armazena o baralho central de cartas disponíveis do servidor.
-// É protegido por um mutex para lidar com o acesso simultâneo de forma segura.
 type GlobalCardStock struct {
 	mu    sync.Mutex
 	Cards map[game.Card]int
 }
 
+// Métodos do Cliente
 func (c *Client) GetName() string                { return c.Name }
 func (c *Client) GetStock() map[game.Card]int   { return c.Stock }
 func (c *Client) GetPlayedCard() game.Card     { return c.PlayedCard }
@@ -77,6 +83,18 @@ func (c *Client) RemoveCard(card game.Card) {
 	}
 }
 func (c *Client) AddCard(card game.Card) { c.Stock[card]++ }
+func (c *Client) SetState(state string) {
+	c.stateMutex.Lock()
+	defer c.stateMutex.Unlock()
+	c.State = state
+}
+func (c *Client) GetState() string {
+	c.stateMutex.RLock()
+	defer c.stateMutex.RUnlock()
+	return c.State
+}
+
+// Métodos dos Gerenciadores
 func (m *PairedClientsManager) MatchAdder(c1 *Client, c2 *Client) {
 	m.locker.Lock()
 	defer m.locker.Unlock()
@@ -111,38 +129,29 @@ func (m *WaitingQueueManager) WQueueRemover(client *Client) {
 	}
 }
 
+// Variáveis Globais
 var (
 	waitingQueueManager  = &WaitingQueueManager{WaitingQueue: []*Client{}}
 	pairedClientsManager = &PairedClientsManager{PairedClients: make(map[string]string)}
-	// Inicializa o estoque global com um número finito de cartas
-	globalStock = &GlobalCardStock{
+	globalStock          = &GlobalCardStock{
 		Cards: map[game.Card]int{
-			game.Rock:    20,
-			game.Paper:   20,
-			game.Scissors: 20,
+			game.Rock: 20, game.Paper: 20, game.Scissors: 20,
 		},
 	}
 )
 
-// File: server/game_server.go
-
-// Start initializes the game server and returns a function to shut it down.
+// Start inicializa o servidor e retorna uma função para desligá-lo.
 func Start() (shutdown func()) {
 	fmt.Println("Game server starting on port 8080...")
 	listener, err := net.Listen("tcp", ":8080")
 	if err != nil {
-		// Em um teste, não podemos nos recuperar disso, então causamos pânico.
-		// Em produção real, um log fatal seria mais apropriado.
 		panic(fmt.Sprintf("Error starting server: %v", err))
 	}
 
-	// A goroutine anônima executa o loop de aceitação de conexões.
 	go func() {
 		for {
 			conn, err := listener.Accept()
 			if err != nil {
-				// Quando listener.Close() é chamado, Accept() retorna um erro.
-				// Este é o sinal para parar de aceitar conexões.
 				fmt.Println("Listener closed, shutting down accept loop.")
 				return
 			}
@@ -150,16 +159,15 @@ func Start() (shutdown func()) {
 		}
 	}()
 
-	// Retorna uma função que, quando chamada, fechará o listener.
 	return func() {
 		fmt.Println("Shutting down server...")
 		listener.Close()
 	}
 }
 
+// handleClientConnection gerencia o ciclo de vida de um cliente.
 func handleClientConnection(conn net.Conn) {
 	defer conn.Close()
-	decoder := json.NewDecoder(conn)
 
 	client, err := handleRegister(conn)
 	if err != nil {
@@ -168,15 +176,19 @@ func handleClientConnection(conn net.Conn) {
 	}
 	fmt.Printf("Client '%s' (%s) registered successfully.\n", client.Name, client.IP)
 
-	for {
+	for client.GetState() != "InGame" {
 		var msg Message
-		err := decoder.Decode(&msg)
+		err := client.Decoder.Decode(&msg)
 		if err != nil {
-			fmt.Printf("Client %s disconnected: %v\n", client.IP, err)
+			fmt.Printf("Client %s disconnected while in state '%s': %v\n", client.IP, client.GetState(), err)
 			close(client.MoveChan)
 			waitingQueueManager.WQueueRemover(client)
 			pairedClientsManager.MatchRemover(client)
 			return
+		}
+
+		if client.GetState() == "InGame" {
+			break
 		}
 
 		switch msg.Action {
@@ -186,14 +198,16 @@ func handleClientConnection(conn net.Conn) {
 			handlePlay(client, msg)
 		case "queue_for_match":
 			handleQueueForMatch(client)
-		case "open_pack": // NOVA AÇÃO
+		case "open_pack":
 			handleOpenPack(client)
 		default:
-			sendErrorMessage(client.Encoder, "Unknown action.")
+			sendErrorMessage(client.Encoder, fmt.Sprintf("Unknown action or action not allowed in state '%s'", client.GetState()))
 		}
 	}
+	fmt.Printf("Handing off client %s to game loop.\n", client.IP)
 }
 
+// handleRegister processa a mensagem inicial de registro.
 func handleRegister(conn net.Conn) (*Client, error) {
 	decoder := json.NewDecoder(conn)
 	var msg Message
@@ -221,11 +235,18 @@ func handleRegister(conn net.Conn) (*Client, error) {
 		Encoder:    json.NewEncoder(conn),
 		Decoder:    decoder,
 		MoveChan:   make(chan game.Card),
+		State:      "Idle",
 	}
 	return client, nil
 }
 
+// handleQueueForMatch valida e adiciona um jogador à fila de espera.
 func handleQueueForMatch(client *Client) {
+	if len(client.GetStock()) == 0 {
+		sendErrorMessage(client.Encoder, "You have no cards left! Open a pack to get more cards before playing.")
+		return
+	}
+	client.SetState("InQueue")
 	fmt.Printf("Client %s requested to enter the matchmaking queue.\n", client.IP)
 	waitingQueueManager.WQueueAdder(client)
 	confirmMsg, _ := json.Marshal(ResponseMessage{Content: "You are now in the matchmaking queue. Waiting for an opponent..."})
@@ -234,13 +255,16 @@ func handleQueueForMatch(client *Client) {
 	tryMatch()
 }
 
-// handleOpenPack lida com a solicitação do cliente para abrir um pacote de cartas.
+// handleOpenPack permite que jogadores ociosos abram pacotes.
 func handleOpenPack(client *Client) {
+	if client.GetState() != "Idle" {
+		sendErrorMessage(client.Encoder, "You can only open packs when you are not in a queue or in a game.")
+		return
+	}
 	globalStock.mu.Lock()
 	defer globalStock.mu.Unlock()
 
 	fmt.Printf("Client %s is opening a card pack...\n", client.IP)
-
 	availableCards := make([]game.Card, 0)
 	for card, quantity := range globalStock.Cards {
 		for i := 0; i < quantity; i++ {
@@ -258,7 +282,6 @@ func handleOpenPack(client *Client) {
 	for i := 0; i < 3; i++ {
 		randomIndex := rand.Intn(len(availableCards))
 		chosenCard := availableCards[randomIndex]
-
 		receivedCards = append(receivedCards, chosenCard)
 		client.AddCard(chosenCard)
 		globalStock.Cards[chosenCard]--
@@ -266,7 +289,6 @@ func handleOpenPack(client *Client) {
 	}
 
 	fmt.Printf("Client %s received: %v. New stock: %v\n", client.IP, receivedCards, client.GetStock())
-
 	payload := OpenPackPayload{
 		Content:  "You opened a pack and received 3 new cards!",
 		NewCards: receivedCards,
@@ -276,43 +298,36 @@ func handleOpenPack(client *Client) {
 	sendActionMessage(client.Encoder, "open_pack_success", responseData)
 }
 
+// tryMatch forma pares de jogadores da fila de espera de forma atômica.
 func tryMatch() {
-	// Bloqueia o acesso à fila durante toda a operação de pareamento.
 	waitingQueueManager.locker.Lock()
 	defer waitingQueueManager.locker.Unlock()
 
-	// Continua a formar pares enquanto houver clientes suficientes na fila.
-	// Este loop garante que todos os pares possíveis sejam formados em uma única operação atômica.
 	for len(waitingQueueManager.WaitingQueue) >= 2 {
-		// Pega os dois primeiros clientes da fila
 		c1 := waitingQueueManager.WaitingQueue[0]
 		c2 := waitingQueueManager.WaitingQueue[1]
-		
-		// Remove-os da fila
 		waitingQueueManager.WaitingQueue = waitingQueueManager.WaitingQueue[2:]
 
-		// A lógica de pareamento e início do jogo agora está DENTRO do mesmo lock.
+		c1.SetState("InGame")
+		c2.SetState("InGame")
+
 		fmt.Printf("Clients paired: %s vs %s\n", c1.IP, c2.IP)
 		pairedClientsManager.MatchAdder(c1, c2)
-
 		pairedMsg, _ := json.Marshal(ResponseMessage{Content: "You have been paired! The game is starting..."})
 		sendActionMessage(c1.Encoder, "matched", pairedMsg)
 		sendActionMessage(c2.Encoder, "matched", pairedMsg)
-
 		go startGame(c1, c2)
 	}
 }
 
+// handlePing responde a uma solicitação de ping do cliente.
 func handlePing(client *Client) {
-	start := time.Now()
-	pongMsg, _ := json.Marshal(ResponseMessage{Content: "PONG"})
+	fmt.Printf("Received ping from %s, sending pong.\n", client.IP)
+	pongMsg, _ := json.Marshal(ResponseMessage{Content: "pong response"})
 	sendActionMessage(client.Encoder, "pong", pongMsg)
-	latency := time.Since(start).Milliseconds()
-	fmt.Printf("Ping from %s: %dms\n", client.IP, latency)
-	latencyMsg, _ := json.Marshal(ResponseMessage{Content: fmt.Sprintf("Ping: %dms", latency)})
-	sendActionMessage(client.Encoder, "pong_response", latencyMsg)
 }
 
+// handlePlay processa a jogada de um jogador durante uma partida.
 func handlePlay(client *Client, msg Message) {
 	var payload struct {
 		ChosenCard game.Card `json:"chosen_card"`
@@ -329,8 +344,18 @@ func handlePlay(client *Client, msg Message) {
 	fmt.Printf("Move received from %s: %s\n", client.IP, payload.ChosenCard)
 }
 
+// startGame gerencia o fluxo de uma partida entre dois jogadores.
 func startGame(c1, c2 *Client) {
 	fmt.Printf("Starting match between %s and %s\n", c1.IP, c2.IP)
+	
+	// Garante que o estado dos jogadores seja resetado no final da partida
+	defer func() {
+		c1.SetState("Idle")
+		c2.SetState("Idle")
+		pairedClientsManager.MatchRemover(c1)
+		fmt.Printf("Match between %s and %s ended. States reset to Idle.\n", c1.IP, c2.IP)
+	}()
+
 	for {
 		promptMsg, _ := json.Marshal(ResponseMessage{Content: "Your turn to play!"})
 		sendActionMessage(c1.Encoder, "game_prompt_play", promptMsg)
@@ -359,17 +384,22 @@ func startGame(c1, c2 *Client) {
 
 		winner, loser := game.DetermineWinner(c1, c2)
 
-		var result string
+		var payload RoundResultPayload
 		if winner == nil {
-			result = fmt.Sprintf("Draw! Both played %s.", c1.GetPlayedCard())
+			payload = RoundResultPayload{Result: "Draw", DrawCard: c1.GetPlayedCard()}
 		} else {
-			result = fmt.Sprintf("Round winner: %s with %s. Loser: %s with %s.", winner.GetName(), winner.GetPlayedCard(), loser.GetName(), loser.GetPlayedCard())
 			game.SwapCards(winner, loser)
+			payload = RoundResultPayload{
+				Result:     "Winner",
+				Winner:     winner.GetName(),
+				Loser:      loser.GetName(),
+				WinnerCard: winner.GetPlayedCard(),
+				LoserCard:  loser.GetPlayedCard(),
+			}
 		}
-
-		resultMsg, _ := json.Marshal(ResponseMessage{Content: result})
-		sendActionMessage(c1.Encoder, "game_round_result", resultMsg)
-		sendActionMessage(c2.Encoder, "game_round_result", resultMsg)
+		resultData, _ := json.Marshal(payload)
+		sendActionMessage(c1.Encoder, "game_round_result", resultData)
+		sendActionMessage(c2.Encoder, "game_round_result", resultData)
 
 		if len(c1.GetStock()) == 0 || len(c2.GetStock()) == 0 {
 			var finalWinner, finalLoser *Client
@@ -384,13 +414,13 @@ func startGame(c1, c2 *Client) {
 
 			sendActionMessage(finalWinner.Encoder, "game_over", gameOverWinMsg)
 			sendActionMessage(finalLoser.Encoder, "game_over", gameOverLoseMsg)
-
 			fmt.Printf("Match finished between %s and %s. Winner: %s\n", c1.IP, c2.IP, finalWinner.IP)
 			return
 		}
 	}
 }
 
+// Funções auxiliares de envio de mensagem.
 func sendActionMessage(encoder *json.Encoder, action string, data json.RawMessage) {
 	finalMsg := Message{
 		Action: action,
