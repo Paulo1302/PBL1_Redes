@@ -133,7 +133,7 @@ var (
 	pairedClientsManager = &PairedClientsManager{PairedClients: make(map[string]string)}
 	globalStock          = &GlobalCardStock{
 		Cards: map[game.Card]int{
-			game.Rock: 2, game.Paper: 2, game.Scissors: 2,
+			game.Rock: 300, game.Paper: 300, game.Scissors: 300,
 		},
 	}
 )
@@ -342,9 +342,9 @@ func handlePing(client *Client) {
 	sendActionMessage(client.Encoder, "pong", pongMsg)
 }
 
-// startGame gerencia o fluxo de uma partida com mensagens de status e timeouts.
+// startGame gerencia o fluxo de uma partida de rodada única.
 func startGame(c1, c2 *Client) {
-	fmt.Printf("Starting match between %s and %s\n", c1.IP, c2.IP)
+	fmt.Printf("Starting single-round match between %s and %s\n", c1.IP, c2.IP)
 	const moveTimeout = 30 * time.Second
 
 	// 'defer' garante que o estado seja limpo e os pares removidos no final da partida.
@@ -355,88 +355,97 @@ func startGame(c1, c2 *Client) {
 		fmt.Printf("Match between %s and %s ended. States reset to Idle.\n", c1.IP, c2.IP)
 	}()
 
-	for {
-		// Verifica a condição de fim de jogo no início de cada rodada.
-		if len(c1.GetStock()) == 0 || len(c2.GetStock()) == 0 {
-			endGameByCardCount(c1, c2)
+	// Verifica se os jogadores têm cartas antes de começar. Se não, encerra.
+	if len(c1.GetStock()) == 0 || len(c2.GetStock()) == 0 {
+		endGameByCardCount(c1, c2)
+		return
+	}
+
+	promptMsg, _ := json.Marshal(ResponseMessage{Content: "Your turn to play! This is a single-round match."})
+	sendActionMessage(c1.Encoder, "game_prompt_play", promptMsg)
+	sendActionMessage(c2.Encoder, "game_prompt_play", promptMsg)
+
+	var move1, move2 game.Card
+	var firstPlayer, secondPlayer *Client
+
+	// 1. Espera pela jogada do PRIMEIRO jogador que se mover.
+	select {
+	case move, ok := <-c1.MoveChan:
+		if !ok {
+			endGameByDisconnect(c2, c1) // c2 vence porque c1 desconectou
 			return
 		}
+		move1 = move
+		firstPlayer, secondPlayer = c1, c2
 
-		promptMsg, _ := json.Marshal(ResponseMessage{Content: "Your turn to play!"})
-		sendActionMessage(c1.Encoder, "game_prompt_play", promptMsg)
-		sendActionMessage(c2.Encoder, "game_prompt_play", promptMsg)
-
-		var move1, move2 game.Card
-		var firstPlayer, secondPlayer *Client
-
-		// 1. Espera pela jogada do PRIMEIRO jogador que se mover.
-		select {
-		case move, ok := <-c1.MoveChan:
-			if !ok {
-				endGameByDisconnect(c2, c1) // c2 vence porque c1 desconectou
-				return
-			}
-			move1 = move
-			firstPlayer, secondPlayer = c1, c2
-
-		case move, ok := <-c2.MoveChan:
-			if !ok {
-				endGameByDisconnect(c1, c2) // c1 vence porque c2 desconectou
-				return
-			}
-			move1 = move // A jogada do primeiro a se mover sempre vai para move1
-			firstPlayer, secondPlayer = c2, c1
-
-		// Timeout geral se nenhum dos dois jogar.
-		case <-time.After(moveTimeout * 2):
-			drawMsg, _ := json.Marshal(ResponseMessage{Content: "Match ended due to inactivity from both players."})
-			sendActionMessage(c1.Encoder, "game_over", drawMsg)
-			sendActionMessage(c2.Encoder, "game_over", drawMsg)
+	case move, ok := <-c2.MoveChan:
+		if !ok {
+			endGameByDisconnect(c1, c2) // c1 vence porque c2 desconectou
 			return
 		}
+		move1 = move
+		firstPlayer, secondPlayer = c2, c1
 
-		// 2. Notifica o SEGUNDO jogador que o oponente já jogou.
-		waitMsg, _ := json.Marshal(ResponseMessage{Content: "Your opponent has made a move. Waiting for you..."})
-		sendActionMessage(secondPlayer.Encoder, "game_status_update", waitMsg)
+	case <-time.After(moveTimeout * 2):
+		drawMsg, _ := json.Marshal(GameOverPayload{Content: "Match ended due to inactivity from both players.", FinalStock: c1.GetStock()})
+		drawMsg2, _ := json.Marshal(GameOverPayload{Content: "Match ended due to inactivity from both players.", FinalStock: c2.GetStock()})
+		sendActionMessage(c1.Encoder, "game_over", drawMsg)
+		sendActionMessage(c2.Encoder, "game_over", drawMsg2)
+		return
+	}
 
-		// 3. Espera pela jogada do SEGUNDO jogador, agora com um timeout.
-		select {
-		case move, ok := <-secondPlayer.MoveChan:
-			if !ok {
-				endGameByDisconnect(firstPlayer, secondPlayer) // O primeiro jogador vence
-				return
-			}
-			move2 = move
+	// 2. Notifica o SEGUNDO jogador que o oponente já jogou.
+	waitMsg, _ := json.Marshal(ResponseMessage{Content: "Your opponent has made a move. Waiting for you..."})
+	sendActionMessage(secondPlayer.Encoder, "game_status_update", waitMsg)
 
-		case <-time.After(moveTimeout):
-			endGameByTimeout(firstPlayer, secondPlayer) // O primeiro jogador vence
+	// 3. Espera pela jogada do SEGUNDO jogador, agora com um timeout.
+	select {
+	case move, ok := <-secondPlayer.MoveChan:
+		if !ok {
+			endGameByDisconnect(firstPlayer, secondPlayer) // O primeiro jogador vence
 			return
 		}
+		move2 = move
 
-		// 4. Ambas as jogadas foram recebidas, processa a rodada.
-		firstPlayer.SetPlayedCard(move1)
-		secondPlayer.SetPlayedCard(move2)
-		firstPlayer.RemoveCard(move1)
-		secondPlayer.RemoveCard(move2)
+	case <-time.After(moveTimeout):
+		endGameByTimeout(firstPlayer, secondPlayer) // O primeiro jogador vence
+		return
+	}
 
-		winner, loser := game.DetermineWinner(firstPlayer, secondPlayer)
+	// 4. Ambas as jogadas foram recebidas, processa a rodada e finaliza o jogo.
+	firstPlayer.SetPlayedCard(move1)
+	secondPlayer.SetPlayedCard(move2)
+	firstPlayer.RemoveCard(move1)
+	secondPlayer.RemoveCard(move2)
 
-		var payload RoundResultPayload
-		if winner == nil {
-			payload = RoundResultPayload{Result: "Draw", DrawCard: firstPlayer.GetPlayedCard()}
-		} else {
-			game.SwapCards(winner, loser)
-			payload = RoundResultPayload{
-				Result:     "Winner",
-				Winner:     winner.GetName(),
-				Loser:      loser.GetName(),
-				WinnerCard: winner.GetPlayedCard(),
-				LoserCard:  loser.GetPlayedCard(),
-			}
+	winner, loser := game.DetermineWinner(firstPlayer, secondPlayer)
+
+	if winner == nil {
+		// Empate: Apenas informa o fim do jogo.
+		drawPayload := GameOverPayload{
+			Content:    "Game Over! The round was a draw.",
+			FinalStock: firstPlayer.GetStock(), // Estoque final do primeiro jogador
 		}
-		resultData, _ := json.Marshal(payload)
-		sendActionMessage(c1.Encoder, "game_round_result", resultData)
-		sendActionMessage(c2.Encoder, "game_round_result", resultData)
+		drawPayload2 := GameOverPayload{
+			Content:    "Game Over! The round was a draw.",
+			FinalStock: secondPlayer.GetStock(), // Estoque final do segundo jogador
+		}
+		drawMsg, _ := json.Marshal(drawPayload)
+		drawMsg2, _ := json.Marshal(drawPayload2)
+		sendActionMessage(firstPlayer.Encoder, "game_over", drawMsg)
+		sendActionMessage(secondPlayer.Encoder, "game_over", drawMsg2)
+		fmt.Printf("Match ended in a draw between %s and %s.\n", c1.IP, c2.IP)
+	} else {
+		// Houve um vencedor: distribui as cartas e informa o fim do jogo.
+		game.SwapCards(winner, loser)
+		fmt.Printf("Round winner: %s. Cards swapped.\n", winner.GetName())
+
+		winMsg, _ := json.Marshal(GameOverPayload{Content: "You won the round!", FinalStock: winner.GetStock()})
+		loseMsg, _ := json.Marshal(GameOverPayload{Content: "You lost the round!", FinalStock: loser.GetStock()})
+
+		// CORREÇÃO: Faz a asserção de tipo de game.Player para *Client para acessar o Encoder.
+		sendActionMessage(winner.(*Client).Encoder, "game_over", winMsg)
+		sendActionMessage(loser.(*Client).Encoder, "game_over", loseMsg)
 	}
 }
 

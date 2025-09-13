@@ -143,6 +143,17 @@ func ServerConn(serverIP string) error {
 			pingManager.mu.Unlock()
 			msg.Action = "ping"
 		case "play":
+			// AJUSTE: Verifica se o usuário tem cartas antes de entrar na fila.
+			totalCards := 0
+			for _, quantity := range currentUserData.Stock {
+				totalCards += quantity
+			}
+
+			if totalCards == 0 {
+				fmt.Println("Você não tem cartas para jogar! Use o comando 'pack' para conseguir mais.")
+				continue // Impede o envio da mensagem e aguarda o próximo comando.
+			}
+			
 			msg.Action = "queue_for_match"
 		case "pack":
 			msg.Action = "open_pack"
@@ -158,8 +169,13 @@ func ServerConn(serverIP string) error {
 			if len(currentUserData.Stock) == 0 {
 				fmt.Println("  - Nenhuma carta restante.")
 			} else {
+				totalCards := 0
 				for card, quantity := range currentUserData.Stock {
 					fmt.Printf("  - %s: %d\n", card, quantity)
+					totalCards += quantity
+				}
+				if totalCards == 0 {
+					fmt.Println("  (Você precisa abrir um pacote para obter novas cartas)")
 				}
 			}
 			continue
@@ -199,7 +215,6 @@ func ServerConn(serverIP string) error {
 	}
 	return scanner.Err()
 }
-
 // listenServer processa mensagens recebidas do servidor em uma goroutine separada.
 func listenServer(conn net.Conn) {
 	decoder := json.NewDecoder(conn)
