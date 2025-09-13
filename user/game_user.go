@@ -87,9 +87,9 @@ func loadData() {
 		currentUserData = UserData{
 			Name: strings.TrimSpace(name),
 			Stock: map[string]int{
-				"Rock":     3,
-				"Paper":    3,
-				"Scissors": 3,
+				"Rock":     0,
+				"Paper":    0,
+				"Scissors": 0,
 			},
 		}
 		if err := saveData(); err != nil {
