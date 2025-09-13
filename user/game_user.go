@@ -96,9 +96,9 @@ func loadData() {
 		currentUserData = UserData{
 			Name: strings.TrimSpace(name),
 			Stock: map[string]int{ // O inventário inicial é zero.
-				"Rock":     0,
-				"Paper":    0,
-				"Scissors": 0,
+				"Rock":     1,
+				"Paper":    1,
+				"Scissors": 1,
 			},
 		}
 		if err := saveData(); err != nil {

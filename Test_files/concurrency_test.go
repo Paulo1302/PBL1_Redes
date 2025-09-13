@@ -12,7 +12,7 @@ import (
 // TestStressMatchmaking valida a sincronização do pareamento sob carga.
 func TestStressMatchmaking(t *testing.T) {
 	// (Este teste foi mantido e aprimorado com o helper 'readMessage')
-	numClients := 50 // Deve ser um número par
+	numClients := 100 // Deve ser um número par
 	var wg sync.WaitGroup
 	wg.Add(numClients)
 
@@ -48,7 +48,7 @@ func TestStressMatchmaking(t *testing.T) {
 // TestConcurrentPackOpening simula múltiplos clientes abrindo pacotes ao mesmo tempo
 // para garantir que o estoque global do servidor seja manipulado de forma segura.
 func TestConcurrentPackOpening(t *testing.T) {
-	numClients := 50
+	numClients := 100
 	packsPerClient := 3
 	var wg sync.WaitGroup
 	wg.Add(numClients)
@@ -79,5 +79,73 @@ func TestConcurrentPackOpening(t *testing.T) {
 			})
 		}(i)
 	}
+	wg.Wait()
+}
+
+
+// TestStressPing aplica uma carga de múltiplos clientes enviando pings repetidamente
+// e calcula a latência média de resposta para cada um.
+func TestStressPing(t *testing.T) {
+	concurrency := 100 // Número de clientes simultâneos
+	pingsPerClient := 10 // Quantidade de pings que cada cliente enviará
+
+	var wg sync.WaitGroup
+	wg.Add(concurrency)
+
+	for i := 0; i < concurrency; i++ {
+		go func(id int) {
+			defer wg.Done()
+			clientName := fmt.Sprintf("PingClient_%d", id)
+
+			t.Run(clientName, func(t *testing.T) {
+				t.Parallel() // Permite que os clientes rodem em paralelo
+
+				conn := connectAndRegister(t, clientName, make(map[string]int))
+				defer conn.Close()
+
+				encoder := json.NewEncoder(conn)
+				decoder := json.NewDecoder(conn)
+				pingMsg := Message{Action: "ping"}
+				
+				var totalLatency time.Duration
+				var successfulPings int
+
+				// Cada cliente envia múltiplos pings em sequência
+				for j := 0; j < pingsPerClient; j++ {
+					startTime := time.Now() // Marca o tempo de início
+
+					if err := encoder.Encode(pingMsg); err != nil {
+						t.Errorf("Request #%d: Failed to send ping: %v", j+1, err)
+						return 
+					}
+
+					conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+					var response Message
+					if err := decoder.Decode(&response); err != nil {
+						t.Errorf("Request #%d: Failed to receive pong: %v", j+1, err)
+						return
+					}
+					
+					// Calcula a latência se a resposta for bem-sucedida
+					if response.Action == "pong" {
+						latency := time.Since(startTime)
+						totalLatency += latency
+						successfulPings++
+					} else {
+						t.Errorf("Request #%d: Expected action 'pong' but got '%s'", j+1, response.Action)
+						return
+					}
+				}
+
+				// Calcula e exibe a latência média para este cliente
+				if successfulPings > 0 {
+					averageLatency := totalLatency / time.Duration(successfulPings)
+					t.Logf("Latência média para %s: %v", clientName, averageLatency)
+				}
+			})
+		}(i)
+	}
+
+	// Espera que todos os clientes terminem
 	wg.Wait()
 }
