@@ -1,12 +1,13 @@
-// File: Test_files/game_rules_test.go
+// File: game/game_rules_test.go
 package server_test
 
 import (
 	"PBL1_Redes-card_game/game"
+	"reflect"
 	"testing"
 )
 
-// MockJogador é uma implementação de teste da interface game.Player.
+// MockPlayer é uma implementação de teste da interface game.Player.
 type MockPlayer struct {
 	Name       string
 	Stock      map[game.Card]int
@@ -17,21 +18,30 @@ func (m *MockPlayer) GetName() string                { return m.Name }
 func (m *MockPlayer) GetStock() map[game.Card]int   { return m.Stock }
 func (m *MockPlayer) GetPlayedCard() game.Card     { return m.PlayedCard }
 func (m *MockPlayer) SetPlayedCard(c game.Card)      { m.PlayedCard = c }
-func (m *MockPlayer) RemoveCard(c game.Card)         { m.Stock[c]-- }
-func (m *MockPlayer) AddCard(c game.Card)            { m.Stock[c]++ }
+func (m *MockPlayer) RemoveCard(c game.Card) {
+	if m.Stock[c] > 0 {
+		m.Stock[c]--
+		if m.Stock[c] == 0 {
+			delete(m.Stock, c)
+		}
+	}
+}
+func (m *MockPlayer) AddCard(c game.Card) { m.Stock[c]++ }
 
 // TestDetermineWinner valida todos os cenários de vitória, derrota e empate.
 func TestDetermineWinner(t *testing.T) {
+	// (Este teste foi mantido como estava, pois já era robusto)
 	scenarios := []struct {
-		name         string
-		p1Card       game.Card
-		p2Card       game.Card
-		expectedWin  string // Nome do vencedor esperado
+		name        string
+		p1Card      game.Card
+		p2Card      game.Card
+		expectedWin string // Nome do vencedor esperado
 	}{
 		{"Rock beats Scissors", game.Rock, game.Scissors, "Player1"},
 		{"Paper beats Rock", game.Paper, game.Rock, "Player1"},
 		{"Scissors beats Paper", game.Scissors, game.Paper, "Player1"},
 		{"Draw with Rock", game.Rock, game.Rock, ""},
+		{"Rock loses to Paper", game.Rock, game.Paper, "Player2"},
 	}
 
 	for _, scenario := range scenarios {
@@ -55,5 +65,31 @@ func TestDetermineWinner(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestSwapCards valida se a troca de cartas entre vencedor e perdedor funciona corretamente.
+func TestSwapCards(t *testing.T) {
+	winner := &MockPlayer{
+		Name:  "Winner",
+		Stock: map[game.Card]int{game.Rock: 1},
+	}
+	loser := &MockPlayer{
+		Name:  "Loser",
+		Stock: map[game.Card]int{game.Paper: 2},
+	}
+	winner.SetPlayedCard(game.Rock)
+	loser.SetPlayedCard(game.Paper)
+
+	game.SwapCards(winner, loser)
+
+	expectedWinnerStock := map[game.Card]int{game.Rock: 1, game.Paper: 1}
+	expectedLoserStock := map[game.Card]int{game.Paper: 1, game.Rock: 1}
+
+	if !reflect.DeepEqual(winner.GetStock(), expectedWinnerStock) {
+		t.Errorf("Winner stock is incorrect. Got: %v, Expected: %v", winner.GetStock(), expectedWinnerStock)
+	}
+	if !reflect.DeepEqual(loser.GetStock(), expectedLoserStock) {
+		t.Errorf("Loser stock is incorrect. Got: %v, Expected: %v", loser.GetStock(), expectedLoserStock)
 	}
 }
