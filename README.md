@@ -76,7 +76,7 @@ Neste ponto, o servidor do jogo estará no ar e pronto para aceitar conexões na
 Para jogar, inicie o container do cliente de forma interativa. Ele se conectará automaticamente ao container do servidor.
 
 ```bash
-docker-compose run --rm client
+docker-compose run --rm client [IP_OPCIONAL_DO_SERVIDOR]
 ```
 
 **Análise do Comando:**
