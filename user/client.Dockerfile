@@ -1,18 +1,27 @@
-# File: user/client.Dockerfile
+# --- ESTÁGIO 1: Construtor (Builder) ---
+FROM golang:1.22-alpine AS builder
 
-# --- Estágio 1: Build ---
-FROM golang:1.21-alpine AS builder
 WORKDIR /app
-COPY go.mod go.sum* ./
-RUN go mod download
+
+# Copia todos os arquivos do projeto para o diretório de trabalho.
+# Fazemos isso primeiro, pois o go.sum pode não existir localmente.
 COPY . .
 
-# CORREÇÃO: O caminho para o build agora aponta para o novo ponto de entrada
-RUN CGO_ENABLED=0 go build -o /client_app ./cmd/client
+# O comando 'go mod tidy' garante que o go.mod e o go.sum estejam
+# consistentes, baixando as dependências necessárias e criando o go.sum.
+RUN go mod tidy
+
+# Agora, compila o código do cliente.
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o /app/client-exec ./cmd/client
 
 
-# --- Estágio 2: Final ---
+# --- ESTÁGIO 2: Final ---
 FROM scratch
+
 WORKDIR /
-COPY --from=builder /client_app .
-CMD ["/client_app"]
+
+# Copia o executável compilado.
+COPY --from=builder /app/client-exec /client-exec
+
+# Define o ponto de entrada.
+ENTRYPOINT ["/client-exec"]
